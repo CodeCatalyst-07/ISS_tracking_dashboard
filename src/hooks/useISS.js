@@ -1,12 +1,15 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { safeFetch } from '../utils/api';
+
+// Production: 20s polling. Dev: 16s.
+const POLL_INTERVAL = import.meta.env.PROD ? 20000 : 16000;
+
+// Module-level guards — survive HMR re-renders and React StrictMode double-mounts
+let isFetching = false;
+let lastFetchTime = 0;
+const MIN_FETCH_GAP_MS = 15000; // never fetch more than once per 15s no matter what
 
 const MAX_POSITIONS = 15;
 const MAX_SPEED_HISTORY = 30;
-const POLL_INTERVAL_MS = 16000; // 16s — keeps well under wheretheiss.at rate limit
-
-// Module-level fetch lock — persists across HMR hot-reloads
-let isFetching = false;
 
 // Static fallback crew when all astronaut APIs fail
 const FALLBACK_CREW = [
@@ -24,7 +27,7 @@ function formatTime(timestamp) {
 }
 
 function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 export function useISS(addToast) {
@@ -44,137 +47,105 @@ export function useISS(addToast) {
   const intervalRef = useRef(null);
   const isMountedRef = useRef(true);
 
-  // ── ISS Position Fetch ──────────────────────────────────────────────
+  // ── ISS Position ────────────────────────────────────────────────────
   const fetchPosition = useCallback(async () => {
-    if (isFetching) return; // lock — prevent overlapping calls
+    const now = Date.now();
+
+    // Hard gap guard — never fire within 15s of last successful call
+    if (isFetching || (now - lastFetchTime) < MIN_FETCH_GAP_MS) return;
+
     isFetching = true;
+    lastFetchTime = now;
 
-    const ISS_ENDPOINTS = [
-      {
-        // Primary: wheretheiss.at direct
-        url: 'https://api.wheretheiss.at/v1/satellites/25544',
-        parse: (data) => ({
-          lat: data.latitude,
-          lng: data.longitude,
-          timestamp: Math.floor(data.timestamp),
-          velocity: Math.round(data.velocity),
-          altitude: parseFloat(data.altitude).toFixed(1),
-        }),
-      },
-      {
-        // Secondary: wheretheiss.at via CORS proxy (bypasses per-IP 429)
-        url: 'https://corsproxy.io/?' + encodeURIComponent('https://api.wheretheiss.at/v1/satellites/25544'),
-        parse: (data) => ({
-          lat: data.latitude,
-          lng: data.longitude,
-          timestamp: Math.floor(data.timestamp),
-          velocity: Math.round(data.velocity),
-          altitude: parseFloat(data.altitude).toFixed(1),
-        }),
-      },
-      {
-        // Tertiary: open-notify via corsproxy (offline but worth 1 try)
-        url: 'https://corsproxy.io/?' + encodeURIComponent('https://api.open-notify.org/iss-now.json'),
-        parse: (data) => ({
-          lat: parseFloat(data.iss_position.latitude),
-          lng: parseFloat(data.iss_position.longitude),
-          timestamp: data.timestamp,
-          velocity: 27600,
-          altitude: '408.0',
-        }),
-      },
-    ];
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 8000);
 
-    let lastErr;
-    for (const endpoint of ISS_ENDPOINTS) {
-      try {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 8000);
-        const res = await fetch(endpoint.url, { signal: controller.signal });
-        clearTimeout(timer);
+      const res = await fetch('https://api.wheretheiss.at/v1/satellites/25544', {
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
 
-        if (res.status === 429) {
-          addToast?.('ISS API rate limited — retrying in 5s', 'warning');
-          await sleep(5000);
-          // try next endpoint
-          lastErr = new Error('429 rate limited');
-          continue;
-        }
-
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-
-        const raw = await res.json();
-        const data = endpoint.parse(raw);
-
-        if (!isMountedRef.current) return;
-
-        const newPos = { lat: data.lat, lng: data.lng, timestamp: data.timestamp };
-
-        setError(null);
-        setLoading(false);
-        setCurrentPos(newPos);
-        setSpeed(data.velocity);
-        setAltitude(String(data.altitude));
-        setLastUpdated(formatTime(data.timestamp));
-
-        setPositions((prev) => [...prev, newPos].slice(-MAX_POSITIONS));
-        setSpeedHistory((sh) => [
-          ...sh,
-          { time: formatTime(data.timestamp), speed: data.velocity },
-        ].slice(-MAX_SPEED_HISTORY));
-
-        // Async geocode — non-blocking
-        import('../utils/geocode').then(({ reverseGeocode }) => {
-          reverseGeocode(newPos.lat, newPos.lng).then((name) => {
-            if (isMountedRef.current) setLocationName(name);
-          });
-        });
-
+      if (res.status === 429) {
+        // Rate limited — back off 30s, don't update lastFetchTime so next
+        // interval will try again but at least 30s from now
+        addToast?.('ISS API rate limited — retrying in 30s', 'warning');
+        lastFetchTime = now + 15000; // extend the gap
+        await sleep(30000);
         isFetching = false;
-        return; // success — stop trying endpoints
-      } catch (err) {
-        lastErr = err;
-        // continue to next endpoint
+        return;
       }
-    }
 
-    // All endpoints failed
-    if (isMountedRef.current) {
-      const msg = lastErr?.name === 'AbortError'
-        ? 'ISS API timed out'
-        : lastErr?.message || 'Failed to fetch ISS data';
-      setError(msg);
+      if (!res.ok) throw new Error(`wheretheiss HTTP ${res.status}`);
+
+      const data = await res.json();
+      if (!isMountedRef.current) { isFetching = false; return; }
+
+      const newPos = {
+        lat: data.latitude,
+        lng: data.longitude,
+        timestamp: Math.floor(data.timestamp),
+      };
+
+      setError(null);
       setLoading(false);
+      setCurrentPos(newPos);
+      setSpeed(Math.round(data.velocity));
+      setAltitude(parseFloat(data.altitude).toFixed(1));
+      setLastUpdated(formatTime(newPos.timestamp));
+
+      setPositions((prev) => [...prev, newPos].slice(-MAX_POSITIONS));
+      setSpeedHistory((sh) => [
+        ...sh,
+        { time: formatTime(newPos.timestamp), speed: Math.round(data.velocity) },
+      ].slice(-MAX_SPEED_HISTORY));
+
+      // Async geocode — never blocks the render
+      import('../utils/geocode').then(({ reverseGeocode }) => {
+        reverseGeocode(newPos.lat, newPos.lng).then((name) => {
+          if (isMountedRef.current) setLocationName(name);
+        });
+      });
+    } catch (err) {
+      if (isMountedRef.current) {
+        const msg = err.name === 'AbortError' ? 'ISS API timed out' : err.message;
+        setError(msg);
+        setLoading(false);
+      }
+    } finally {
+      isFetching = false;
     }
-    isFetching = false;
   }, [addToast]);
 
-  // ── Astronaut Fetch ─────────────────────────────────────────────────
+  // ── Astronauts ──────────────────────────────────────────────────────
   const fetchAstronauts = useCallback(async () => {
-    // Try 1: corsproxy.io → open-notify
     try {
-      const res = await safeFetch('https://api.open-notify.org/astros.json');
+      // open-notify is offline — go straight to allorigins proxy
+      const res = await fetch(
+        `https://api.allorigins.win/raw?url=${encodeURIComponent('https://api.open-notify.org/astros.json')}`,
+        { signal: AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined }
+      );
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       if (isMountedRef.current) {
         setAstronautCount(data.number);
         setAstronauts(data.people);
         setIsCachedCrew(false);
       }
-      return;
     } catch {
-      // fall through to static fallback
-    }
-
-    // Fallback: static crew
-    if (isMountedRef.current) {
-      setAstronautCount(FALLBACK_CREW.length);
-      setAstronauts(FALLBACK_CREW);
-      setIsCachedCrew(true);
-      addToast?.('Showing cached astronaut data', 'warning');
+      // Fallback to static crew
+      if (isMountedRef.current) {
+        setAstronautCount(FALLBACK_CREW.length);
+        setAstronauts(FALLBACK_CREW);
+        setIsCachedCrew(true);
+        addToast?.('Showing cached astronaut data', 'warning');
+      }
     }
   }, [addToast]);
 
   const refresh = useCallback(() => {
+    // Reset the gap guard so manual refresh always works
+    lastFetchTime = 0;
     setLoading(true);
     setError(null);
     fetchPosition();
@@ -183,15 +154,18 @@ export function useISS(addToast) {
   useEffect(() => {
     isMountedRef.current = true;
 
-    fetchPosition();
+    // Stagger initial fetch slightly to avoid StrictMode double-mount race
+    const initTimer = setTimeout(() => fetchPosition(), 300);
     fetchAstronauts();
 
-    intervalRef.current = setInterval(fetchPosition, POLL_INTERVAL_MS);
+    intervalRef.current = setInterval(fetchPosition, POLL_INTERVAL);
 
     return () => {
       isMountedRef.current = false;
+      clearTimeout(initTimer);
       if (intervalRef.current) clearInterval(intervalRef.current);
-      isFetching = false; // release lock on unmount
+      isFetching = false;
+      lastFetchTime = 0;
     };
   }, [fetchPosition, fetchAstronauts]);
 

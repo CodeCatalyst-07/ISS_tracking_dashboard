@@ -1,58 +1,58 @@
 /**
- * safeFetch — attempts a direct fetch first, then retries via CORS proxy
- * on network/CORS errors. Auth errors (4xx) are thrown immediately.
+ * safeFetch — direct fetch first, then cascades through multiple CORS proxies.
+ * allorigins.win is primary proxy (more reliable in production than corsproxy.io).
  */
 
-const CORS_PROXY = 'https://corsproxy.io/?';
+const CORS_PROXIES = [
+  (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+  (url) => `https://corsproxy.io/?${encodeURIComponent(url)}`,
+];
+
+async function fetchWithTimeout(url, options = {}, ms = 8000) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), ms);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(id);
+  }
+}
 
 export async function safeFetch(url, options = {}) {
-  // ── Attempt 1: Direct fetch ────────────────────────────────────────
+  // ── Attempt 1: Direct (no proxy) ──────────────────────────────────
   try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 8000);
-    const res = await fetch(url, { ...options, signal: controller.signal });
-    clearTimeout(timeoutId);
-
+    const res = await fetchWithTimeout(url, options, 8000);
     if (res.ok) return res;
-
-    // 4xx auth/rate errors — throw immediately (proxy won't help)
-    if (res.status === 401 || res.status === 403 || res.status === 429) {
-      throw new Error(`HTTP_${res.status}`);
+    // Auth failures — proxying won't help
+    if (res.status === 401 || res.status === 403) {
+      throw new Error(`AUTH_${res.status}`);
     }
-
-    // Other non-ok → try proxy
     throw new Error(`HTTP_${res.status}`);
   } catch (directErr) {
-    // Don't proxy auth/rate-limit failures
-    if (
-      directErr.message.includes('HTTP_401') ||
-      directErr.message.includes('HTTP_403') ||
-      directErr.message.includes('HTTP_429')
-    ) {
-      throw directErr;
-    }
+    if (directErr.message?.startsWith('AUTH_')) throw directErr;
 
-    // Proxy on: network errors, CORS, connection refused, timeout
-    const isCorsOrNetwork =
-      directErr.name === 'TypeError' ||
+    // Only proxy on network/CORS errors, not on API errors (4xx/5xx non-auth)
+    const isNetworkError =
       directErr.name === 'AbortError' ||
-      directErr.message.includes('Failed to fetch') ||
-      directErr.message.includes('ERR_CONNECTION_REFUSED') ||
-      directErr.message.includes('HTTP_5') ||
-      directErr.message.includes('HTTP_4');
+      directErr.name === 'TypeError' ||
+      directErr.message?.includes('Failed to fetch') ||
+      directErr.message?.includes('ERR_CONNECTION_REFUSED');
 
-    if (!isCorsOrNetwork) throw directErr;
-
-    // ── Attempt 2: Via CORS proxy ──────────────────────────────────
-    const controller2 = new AbortController();
-    const timeoutId2 = setTimeout(() => controller2.abort(), 12000);
-    const proxied = await fetch(
-      CORS_PROXY + encodeURIComponent(url),
-      { ...options, signal: controller2.signal }
-    );
-    clearTimeout(timeoutId2);
-
-    if (proxied.ok) return proxied;
-    throw new Error(`Proxy also failed: HTTP_${proxied.status}`);
+    if (!isNetworkError) throw directErr;
   }
+
+  // ── Attempt 2+: Try each CORS proxy ───────────────────────────────
+  let lastErr;
+  for (const makeProxyUrl of CORS_PROXIES) {
+    try {
+      const res = await fetchWithTimeout(makeProxyUrl(url), options, 12000);
+      if (res.ok) return res;
+      lastErr = new Error(`Proxy HTTP_${res.status}`);
+    } catch (err) {
+      lastErr = err;
+      // continue to next proxy
+    }
+  }
+
+  throw lastErr || new Error(`All proxies failed for: ${url}`);
 }

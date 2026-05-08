@@ -1,16 +1,15 @@
 import { useState, useEffect, useCallback } from 'react';
 import { safeFetch } from '../utils/api';
 
+// 30min cache in production, 15min in dev
+const CACHE_TTL = import.meta.env.PROD ? 30 * 60 * 1000 : 15 * 60 * 1000;
 const CACHE_KEY = 'news_cache';
-const CACHE_TTL = 900000; // 15 minutes
 
-// ── Relative time formatter (no libraries) ─────────────────────────────
+// ── Relative time formatter ────────────────────────────────────────────
 function getRelativeTime(dateStr) {
   if (!dateStr) return 'Recently';
-  const now = Date.now();
-  const then = new Date(dateStr).getTime();
-  if (isNaN(then)) return 'Recently';
-  const diff = Math.floor((now - then) / 1000);
+  const diff = Math.floor((Date.now() - new Date(dateStr).getTime()) / 1000);
+  if (isNaN(diff) || diff < 0) return 'Recently';
   if (diff < 60) return `${diff}s ago`;
   if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
   if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
@@ -70,7 +69,6 @@ function normalizeGuardian(results) {
 
 function normalizeBreakingEvent(event, index) {
   const cats = event.categories || [];
-  const category = cats.length > 0 ? cats[0].label : 'Breaking';
   const images = event.images || [];
   return {
     id: `event-${index}-${event.eventDate}`,
@@ -81,7 +79,7 @@ function normalizeBreakingEvent(event, index) {
     image: images.length > 0 ? images[0] : null,
     description: event.summary?.eng || '',
     url: event.url || '#',
-    category,
+    category: cats.length > 0 ? cats[0].label : 'Breaking',
     type: 'breaking',
     via: 'EventRegistry',
   };
@@ -92,10 +90,10 @@ function readCache() {
   try {
     const raw = localStorage.getItem(CACHE_KEY);
     if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    if (!parsed.data || !parsed.fetchedAt) return null;
-    if (Date.now() - parsed.fetchedAt > CACHE_TTL) return null;
-    return parsed.data;
+    const { data, fetchedAt } = JSON.parse(raw);
+    if (!data || !fetchedAt) return null;
+    if (Date.now() - fetchedAt > CACHE_TTL) return null;
+    return data;
   } catch {
     return null;
   }
@@ -104,44 +102,68 @@ function readCache() {
 function writeCache(data) {
   try {
     localStorage.setItem(CACHE_KEY, JSON.stringify({ data, fetchedAt: Date.now() }));
-  } catch { /* storage full — ignore */ }
+  } catch { /* storage full */ }
 }
 
-// ── Headline cascade fetch ─────────────────────────────────────────────
-async function fetchHeadlines(addToast) {
-  // Source 1: NewsAPI via safeFetch (auto-proxies if CORS blocked)
+// ── Breaking events (EventRegistry) ───────────────────────────────────
+// Note: VITE_NEWS_API_KEY holds the EventRegistry key in this project
+async function fetchBreakingEvents() {
+  const key = import.meta.env.VITE_NEWS_API_KEY;
+  if (!key) return [];
   try {
     const res = await safeFetch(
-      `https://newsapi.org/v2/top-headlines?country=us&pageSize=5&apiKey=${import.meta.env.VITE_NEWS_API_KEY}`
+      `https://eventregistry.org/api/v1/event/getBreakingEvents?breakingEventsMinBreakingScore=0.2&apiKey=${key}`
     );
     const data = await res.json();
-    if (data.status === 'ok' && Array.isArray(data.articles) && data.articles.length > 0) {
-      return normalizeNewsAPI(data.articles);
-    }
-    throw new Error('No articles from NewsAPI');
+    const results = data?.breakingEvents?.results || [];
+    return results.slice(0, 5).map(normalizeBreakingEvent);
   } catch (err) {
-    console.warn('[News] NewsAPI failed:', err.message);
+    console.warn('[News] EventRegistry failed:', err.message);
+    return [];
   }
+}
 
-  // Source 2: GNews (free, no CORS issues)
+// ── Top headlines (cascade: GNews → NewsAPI → Guardian) ────────────────
+async function fetchHeadlines(addToast) {
+  const isProd = import.meta.env.PROD;
+
+  // ── Source 1: GNews (primary — works in both dev and prod via proxy) ──
   if (import.meta.env.VITE_GNEWS_KEY) {
     try {
-      const res = await fetch(
-        `https://gnews.io/api/v4/top-headlines?category=general&lang=en&max=5&apikey=${import.meta.env.VITE_GNEWS_KEY}`
-      );
+      const gnewsUrl = `https://gnews.io/api/v4/top-headlines?category=general&lang=en&max=5&apikey=${import.meta.env.VITE_GNEWS_KEY}`;
+      // In prod GNews blocks vercel.app domains via CORS → use safeFetch (proxied)
+      const res = isProd
+        ? await safeFetch(gnewsUrl)
+        : await fetch(gnewsUrl);
       if (!res.ok) throw new Error(`GNews HTTP ${res.status}`);
       const data = await res.json();
       if (Array.isArray(data.articles) && data.articles.length > 0) {
-        addToast?.('NewsAPI unavailable — using GNews', 'info');
         return normalizeGNews(data.articles);
       }
-      throw new Error('No articles from GNews');
+      throw new Error('GNews returned 0 articles');
     } catch (err) {
       console.warn('[News] GNews failed:', err.message);
     }
   }
 
-  // Source 3: The Guardian (free, excellent CORS support)
+  // ── Source 2: NewsAPI (localhost only — 426 on live domains) ──────────
+  if (!isProd && import.meta.env.VITE_NEWS_API_KEY) {
+    try {
+      const res = await fetch(
+        `https://newsapi.org/v2/top-headlines?country=us&pageSize=5&apiKey=${import.meta.env.VITE_NEWS_API_KEY}`
+      );
+      if (res.ok) {
+        const data = await res.json();
+        if (data.status === 'ok' && data.articles?.length > 0) {
+          return normalizeNewsAPI(data.articles);
+        }
+      }
+    } catch (err) {
+      console.warn('[News] NewsAPI failed (localhost):', err.message);
+    }
+  }
+
+  // ── Source 3: The Guardian (best for prod — no CORS, unlimited free) ─
   if (import.meta.env.VITE_GUARDIAN_KEY) {
     try {
       const res = await fetch(
@@ -154,28 +176,12 @@ async function fetchHeadlines(addToast) {
         addToast?.('Using The Guardian as news source', 'info');
         return normalizeGuardian(results);
       }
-      throw new Error('No results from Guardian');
     } catch (err) {
       console.warn('[News] Guardian failed:', err.message);
     }
   }
 
   return [];
-}
-
-// ── Breaking events fetch ──────────────────────────────────────────────
-async function fetchBreakingEvents() {
-  try {
-    const res = await safeFetch(
-      'https://eventregistry.org/api/v1/event/getBreakingEvents?breakingEventsMinBreakingScore=0.2&apiKey=bd738fcff53c40888d23f2d1f06b57ae'
-    );
-    const data = await res.json();
-    const results = data?.breakingEvents?.results || [];
-    return results.slice(0, 5).map(normalizeBreakingEvent);
-  } catch (err) {
-    console.warn('[News] EventRegistry failed:', err.message);
-    return [];
-  }
 }
 
 // ── Hook ───────────────────────────────────────────────────────────────
@@ -188,22 +194,14 @@ export function useNews(addToast) {
   const [searchQuery, setSearchQuery] = useState('');
   const [sortBy, setSortBy] = useState('date');
   const [selectedCategory, setSelectedCategory] = useState(null);
-  const [sourceStatus, setSourceStatus] = useState({
-    eventRegistry: 'idle',
-    newsapi: 'idle',
-    gnews: 'idle',
-    guardian: 'idle',
-  });
 
   const fetchNews = useCallback(async (forceRefresh = false) => {
-    // Serve from cache if still fresh
+    // Always check cache first — reduces API calls significantly in prod
     if (!forceRefresh) {
       const cached = readCache();
       if (cached) {
-        const breaking = cached.filter((a) => a.type === 'breaking');
-        const headlines = cached.filter((a) => a.type === 'headline');
-        setBreakingArticles(breaking);
-        setHeadlineArticles(headlines);
+        setBreakingArticles(cached.filter((a) => a.type === 'breaking'));
+        setHeadlineArticles(cached.filter((a) => a.type === 'headline'));
         setArticles(cached);
         setLoading(false);
         addToast?.('Using cached news data', 'info');
@@ -213,27 +211,11 @@ export function useNews(addToast) {
 
     setLoading(true);
     setError(null);
-    setSourceStatus({ eventRegistry: 'loading', newsapi: 'loading', gnews: 'idle', guardian: 'idle' });
 
     // Fetch both sources in parallel
     const [breaking, headlines] = await Promise.all([
-      fetchBreakingEvents().then((res) => {
-        setSourceStatus((s) => ({
-          ...s,
-          eventRegistry: res.length > 0 ? 'success' : 'error',
-        }));
-        return res;
-      }),
-      fetchHeadlines(addToast).then((res) => {
-        const via = res[0]?.via || 'none';
-        setSourceStatus((s) => ({
-          ...s,
-          newsapi: via === 'NewsAPI' ? 'success' : 'error',
-          gnews: via === 'GNews' ? 'success' : s.gnews,
-          guardian: via === 'The Guardian' ? 'success' : s.guardian,
-        }));
-        return res;
-      }),
+      fetchBreakingEvents(),
+      fetchHeadlines(addToast),
     ]);
 
     const allArticles = [...breaking, ...headlines];
@@ -246,16 +228,14 @@ export function useNews(addToast) {
       writeCache(allArticles);
       addToast?.('News loaded successfully', 'success');
     } else {
-      setError('No news data available. Check API keys in .env');
-      addToast?.('News sources unavailable — check API keys', 'warning');
+      setError('No news data available. Check API keys in Vercel environment variables.');
+      addToast?.('News sources unavailable', 'warning');
     }
 
     setLoading(false);
   }, [addToast]);
 
-  const refresh = useCallback(() => {
-    fetchNews(true);
-  }, [fetchNews]);
+  const refresh = useCallback(() => fetchNews(true), [fetchNews]);
 
   useEffect(() => {
     fetchNews(false);
@@ -291,6 +271,5 @@ export function useNews(addToast) {
     setSortBy,
     selectedCategory,
     setSelectedCategory,
-    sourceStatus,
   };
 }
